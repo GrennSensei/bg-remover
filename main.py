@@ -13,10 +13,10 @@ from pydantic import BaseModel, Field
 app = FastAPI()
 
 # -------------------------------
-# Free-tier safety limits
+# Render Free safety limits (avoid OOM)
 # -------------------------------
-MAX_SIDE = 2500           # raise if you want; higher may risk RAM on Render Free
-MAX_PIXELS = 4_000_000    # ~4MP cap to avoid OOM
+MAX_SIDE = 3000            # you asked max ~3000x3000 for testing
+MAX_PIXELS = 6_000_000     # keep conservative; 3000x3000=9M would downscale a bit
 
 
 # -------------------------------
@@ -39,12 +39,14 @@ def is_near_color(px_rgb: Tuple[int, int, int], target_rgb: Tuple[int, int, int]
 
 def maybe_downscale(img: Image.Image) -> Image.Image:
     w, h = img.size
+    # pixel cap first
     if w * h > MAX_PIXELS:
         scale = (MAX_PIXELS / (w * h)) ** 0.5
         nw = max(1, int(w * scale))
         nh = max(1, int(h * scale))
         return img.resize((nw, nh), Image.LANCZOS)
 
+    # side cap
     if max(w, h) > MAX_SIDE:
         scale = MAX_SIDE / max(w, h)
         nw = max(1, int(w * scale))
@@ -60,26 +62,78 @@ def maybe_downscale(img: Image.Image) -> Image.Image:
 class RemoveBgRequest(BaseModel):
     image_url: str
 
-    bg_hex: str = Field(default="#FFFFFF", description="Background key color in hex, e.g. #FFFFFF or #00FF00")
-    color_tolerance: int = Field(default=40, ge=0, le=255, description="Per-channel tolerance")
+    bg_hex: str = Field(default="#FFFFFF", description="Key background color, e.g. #FFFFFF or #00FF00")
+    color_tolerance: int = Field(default=55, ge=0, le=255, description="Relaxed tolerance (JPG often needs 45–85)")
+
+    # Two-stage floodfill (recommended for noisy JPG green/white)
+    two_stage: bool = Field(default=True, description="Use strict+relaxed floodfill to avoid eating artwork edges")
+    strict_tolerance: int = Field(default=35, ge=0, le=255, description="Strict tolerance seed for border floodfill")
 
     erode_px: int = Field(default=1, ge=0, le=6, description="Shrinks alpha edge to remove halos")
 
     # Optional: memory-safe hole removal
     remove_holes: bool = Field(default=False, description="Remove enclosed background-colored holes inside artwork")
-    min_hole_area: int = Field(default=400, ge=0, le=10_000_000, description="Only remove holes >= this pixel area")
+    min_hole_area: int = Field(default=400, ge=0, le=10_000_000, description="Remove holes >= this pixel area")
 
     # Optional: edge soften (anti-alias)
-    edge_soften: bool = Field(default=False, description="Apply a gentle edge soften to reduce jagged edges")
-    edge_soften_px: float = Field(default=0.8, ge=0.0, le=5.0, description="Blur radius used for edge soften (default 0.8)")
+    edge_soften: bool = Field(default=False, description="Smooth jagged edges (recommended when tolerance is high)")
+    edge_soften_px: float = Field(default=1.2, ge=0.0, le=5.0, description="Blur radius for edge soften (default 1.2)")
 
 
 # -------------------------------
-# Core: border-connected background mask (memory-safe 1D)
+# Background mask (1D, memory-safe)
+# Two-stage: seed with strict tolerance, then expand with relaxed tolerance
 # -------------------------------
-def floodfill_border_background_mask_1d(img_rgb: Image.Image, target_rgb: Tuple[int, int, int], tol: int) -> bytearray:
-    w, h = img_rgb.size
-    pix = img_rgb.load()
+def floodfill_border_bg_mask_two_stage_1d(
+    img_for_keying: Image.Image,
+    target_rgb: Tuple[int, int, int],
+    tol_strict: int,
+    tol_relaxed: int,
+) -> bytearray:
+    w, h = img_for_keying.size
+    pix = img_for_keying.load()
+
+    mask = bytearray(w * h)  # 0/1
+    q = deque()
+
+    def idx(x, y):
+        return y * w + x
+
+    def try_seed_strict(x, y):
+        i = idx(x, y)
+        if mask[i] == 0 and is_near_color(pix[x, y], target_rgb, tol_strict):
+            mask[i] = 1
+            q.append((x, y))
+
+    # Seed border using STRICT tolerance (safe)
+    for x in range(w):
+        try_seed_strict(x, 0)
+        try_seed_strict(x, h - 1)
+    for y in range(h):
+        try_seed_strict(0, y)
+        try_seed_strict(w - 1, y)
+
+    # Expand from strict seeds using RELAXED tolerance (captures JPG noise/spill),
+    # but only through regions connected to border background.
+    while q:
+        x, y = q.popleft()
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < w and 0 <= ny < h:
+                i = idx(nx, ny)
+                if mask[i] == 0 and is_near_color(pix[nx, ny], target_rgb, tol_relaxed):
+                    mask[i] = 1
+                    q.append((nx, ny))
+
+    return mask
+
+
+def floodfill_border_bg_mask_single_stage_1d(
+    img_for_keying: Image.Image,
+    target_rgb: Tuple[int, int, int],
+    tol: int,
+) -> bytearray:
+    w, h = img_for_keying.size
+    pix = img_for_keying.load()
 
     mask = bytearray(w * h)  # 0/1
     q = deque()
@@ -93,7 +147,6 @@ def floodfill_border_background_mask_1d(img_rgb: Image.Image, target_rgb: Tuple[
             mask[i] = 1
             q.append((x, y))
 
-    # seed borders
     for x in range(w):
         try_seed(x, 0)
         try_seed(x, h - 1)
@@ -101,7 +154,6 @@ def floodfill_border_background_mask_1d(img_rgb: Image.Image, target_rgb: Tuple[
         try_seed(0, y)
         try_seed(w - 1, y)
 
-    # BFS
     while q:
         x, y = q.popleft()
         for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
@@ -134,24 +186,20 @@ def apply_alpha_from_mask_1d(img_rgb: Image.Image, bg_mask_1d: bytearray) -> Ima
 # Optional: memory-safe hole remover (1D visited + BFS)
 # -------------------------------
 def remove_enclosed_holes_memory_safe(
-    img_rgb: Image.Image,
+    img_for_keying: Image.Image,
     rgba: Image.Image,
     border_bg_mask_1d: bytearray,
     target_rgb: Tuple[int, int, int],
     tol: int,
     min_area: int,
 ) -> Image.Image:
-    """
-    Removes background-colored regions that are NOT connected to border (holes),
-    but only if region size >= min_area. Memory-safe using 1D bytearrays.
-    """
     if min_area <= 0:
         min_area = 1
 
-    w, h = img_rgb.size
-    pix = img_rgb.load()
+    w, h = img_for_keying.size
+    pix = img_for_keying.load()
 
-    visited = bytearray(w * h)  # 0/1
+    visited = bytearray(w * h)
     out = rgba.copy()
     p_out = out.load()
 
@@ -168,13 +216,12 @@ def remove_enclosed_holes_memory_safe(
                 continue
             visited[i0] = 1
 
-            # only consider bg-colored pixels that are NOT border-connected bg
+            # Only consider bg-like pixels that are NOT border-connected bg
             if border_bg_mask_1d[i0] == 1:
                 continue
             if not is_bg(x0, y0):
                 continue
 
-            # BFS region
             q = deque([(x0, y0)])
             region = [i0]
 
@@ -187,7 +234,6 @@ def remove_enclosed_holes_memory_safe(
                             continue
                         visited[ii] = 1
 
-                        # skip border-connected background
                         if border_bg_mask_1d[ii] == 1:
                             continue
 
@@ -195,7 +241,6 @@ def remove_enclosed_holes_memory_safe(
                             q.append((nx, ny))
                             region.append(ii)
 
-            # apply if large enough
             if len(region) >= min_area:
                 for ii in region:
                     x = ii % w
@@ -209,7 +254,7 @@ def remove_enclosed_holes_memory_safe(
 # -------------------------------
 # Erode alpha (halo killer)
 # -------------------------------
-def erode_alpha_inplace(rgba: Image.Image, erode_px: int) -> Image.Image:
+def erode_alpha(rgba: Image.Image, erode_px: int) -> Image.Image:
     if erode_px <= 0:
         return rgba
 
@@ -255,20 +300,12 @@ def erode_alpha_inplace(rgba: Image.Image, erode_px: int) -> Image.Image:
 # Optional: edge soften (anti-alias look)
 # -------------------------------
 def edge_soften_alpha(rgba: Image.Image, radius: float) -> Image.Image:
-    """
-    Softens alpha edges using a tiny blur on alpha only, then re-thresholds.
-    This reduces jagged edges and green/white pixel leftovers on contours.
-    """
     if radius <= 0:
         return rgba
 
     r, g, b, a = rgba.split()
     a_blur = a.filter(ImageFilter.GaussianBlur(radius=radius))
-
-    # Re-threshold to keep crisp edges, but smoother than pure binary
-    # 128 is a good default; can be adjusted later if needed.
     a_thr = a_blur.point(lambda v: 255 if v >= 128 else 0)
-
     return Image.merge("RGBA", (r, g, b, a_thr))
 
 
@@ -276,30 +313,54 @@ def edge_soften_alpha(rgba: Image.Image, radius: float) -> Image.Image:
 # Pipeline
 # -------------------------------
 def process_remove_bg(req: RemoveBgRequest) -> bytes:
-    r = requests.get(req.image_url, timeout=45)
+    r = requests.get(req.image_url, timeout=60)
     r.raise_for_status()
 
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     img = maybe_downscale(img)
 
+    # Keying uses a *slightly smoothed* version to reduce JPG speckle in background.
+    # Artwork pixels are never modified; only the mask decisions use this.
+    img_key = img.filter(ImageFilter.BoxBlur(0.6))
+
     target_rgb = hex_to_rgb(req.bg_hex)
+    tol_relaxed = int(req.color_tolerance)
 
-    border_bg = floodfill_border_background_mask_1d(img, target_rgb, req.color_tolerance)
-    rgba = apply_alpha_from_mask_1d(img, border_bg)
+    # Auto-sane strict tolerance for noisy JPGs (unless user sets something else)
+    tol_strict = int(req.strict_tolerance)
+    if req.two_stage:
+        # keep strict below relaxed; if user accidentally set higher, clamp
+        if tol_strict >= tol_relaxed:
+            tol_strict = max(10, tol_relaxed - 30)
 
-    # Optional holes
+        border_bg = floodfill_border_bg_mask_two_stage_1d(
+            img_for_keying=img_key,
+            target_rgb=target_rgb,
+            tol_strict=tol_strict,
+            tol_relaxed=tol_relaxed,
+        )
+    else:
+        border_bg = floodfill_border_bg_mask_single_stage_1d(
+            img_for_keying=img_key,
+            target_rgb=target_rgb,
+            tol=tol_relaxed,
+        )
+
+    rgba = apply_alpha_from_mask_1d(img_rgb=img, bg_mask_1d=border_bg)
+
+    # Optional holes (uses same keying image)
     if req.remove_holes:
         rgba = remove_enclosed_holes_memory_safe(
-            img_rgb=img,
+            img_for_keying=img_key,
             rgba=rgba,
             border_bg_mask_1d=border_bg,
             target_rgb=target_rgb,
-            tol=req.color_tolerance,
+            tol=tol_relaxed,
             min_area=req.min_hole_area,
         )
 
-    # Erode (halo killer)
-    rgba = erode_alpha_inplace(rgba, req.erode_px)
+    # Erode edge (halo killer)
+    rgba = erode_alpha(rgba, req.erode_px)
 
     # Optional edge soften
     if req.edge_soften:
@@ -325,7 +386,22 @@ def root():
         "status": "ok",
         "endpoint": "/remove-bg",
         "test_page": "/test",
-        "notes": "Use bg_hex=#FFFFFF for white, #00FF00 for neon green."
+        "defaults": {
+            "bg_hex": "#FFFFFF",
+            "color_tolerance": 55,
+            "two_stage": True,
+            "strict_tolerance": 35,
+            "erode_px": 1,
+            "edge_soften": False,
+            "edge_soften_px": 1.2,
+            "remove_holes": False,
+            "min_hole_area": 400,
+        },
+        "tips": [
+            "JPG green-screen often needs high tolerance; two_stage helps prevent eating edges.",
+            "If green pixels remain: raise color_tolerance first, then enable edge_soften.",
+            "If internal background pockets remain: enable remove_holes and lower min_hole_area (e.g. 250–600).",
+        ],
     }
 
 
@@ -336,7 +412,7 @@ def root():
 def test_page():
     return """
     <html>
-      <body style="font-family: Arial; max-width: 860px; margin: 40px auto; line-height: 1.4;">
+      <body style="font-family: Arial; max-width: 900px; margin: 40px auto; line-height: 1.4;">
         <h2>Background Remover Test</h2>
         <p>Paste an image URL (JPG/PNG). Choose the key background color (#FFFFFF or #00FF00).</p>
 
@@ -346,11 +422,19 @@ def test_page():
 
           <label><b>Background key color (HEX):</b></label><br/>
           <input name="bg_hex" style="width:220px; padding:10px;" value="#FFFFFF">
-          <span style="margin-left:10px; color:#555;">Try #00FF00 if you generated a neon green background</span>
+          <span style="margin-left:10px; color:#555;">Use #00FF00 for neon green background</span>
           <br/><br/>
 
-          <label><b>Color tolerance:</b> (JPG: 45–65, PNG: 10–35)</label><br/>
+          <label><b>Relaxed tolerance:</b> (JPG often 45–85)</label><br/>
           <input name="color_tolerance" type="number" value="55" min="0" max="255" style="width:120px; padding:10px;"><br/><br/>
+
+          <label><b>Two-stage keying (recommended for JPG):</b></label>
+          <input name="two_stage" type="checkbox" checked>
+          <span style="color:#555;">Strict seeds + relaxed expansion</span>
+          <br/><br/>
+
+          <label><b>Strict tolerance:</b> (seed; typically 20–45)</label><br/>
+          <input name="strict_tolerance" type="number" value="35" min="0" max="255" style="width:120px; padding:10px;"><br/><br/>
 
           <label><b>Erode edge (px):</b> (halo killer; try 1–2)</label><br/>
           <input name="erode_px" type="number" value="1" min="0" max="6" style="width:120px; padding:10px;"><br/><br/>
@@ -368,12 +452,12 @@ def test_page():
           <hr style="margin:18px 0;"/>
 
           <label><b>Edge soften</b> (optional):</label>
-          <input name="edge_soften" type="checkbox" checked>
-          <span style="color:#555;">Smooths jagged contour edges</span>
+          <input name="edge_soften" type="checkbox">
+          <span style="color:#555;">Smooths jagged contour edges (useful when tolerance is high)</span>
           <br/><br/>
 
-          <label><b>Edge soften radius (px):</b> (default 0.8)</label><br/>
-          <input name="edge_soften_px" type="number" value="0.8" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
+          <label><b>Edge soften radius (px):</b> (recommended 1.2 for noisy JPG)</label><br/>
+          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
 
           <button type="submit" style="padding:12px 16px; font-weight:bold; cursor:pointer;">
             Generate Transparent PNG
@@ -381,10 +465,9 @@ def test_page():
         </form>
 
         <p style="margin-top:16px; color:#666;">
-          Tips:
-          <br/>• If you see 1px halos, increase <b>Erode</b> to 2.
-          <br/>• If green background leaves pixels, increase <b>Tolerance</b> slightly, then rely on <b>Edge soften</b>.
-          <br/>• If internal background pockets remain, enable <b>Remove enclosed holes</b> and raise <b>Min hole area</b>.
+          Suggested starting presets:
+          <br/><b>White JPG</b>: tol=55, strict=35, erode=1, edge_soften OFF, holes OFF.
+          <br/><b>Green JPG (noisy)</b>: tol=75, strict=35, erode=1, edge_soften ON (1.2), holes ON (min 300–600).
         </p>
       </body>
     </html>
@@ -396,23 +479,27 @@ def test_submit(
     image_url: str = Form(...),
     bg_hex: str = Form("#FFFFFF"),
     color_tolerance: int = Form(55),
+    two_stage: str = Form(None),
+    strict_tolerance: int = Form(35),
     erode_px: int = Form(1),
     remove_holes: str = Form(None),
     min_hole_area: int = Form(400),
     edge_soften: str = Form(None),
-    edge_soften_px: float = Form(0.8),
+    edge_soften_px: float = Form(1.2),
 ):
-    remove_holes_bool = str(remove_holes).lower() in ("true", "1", "on", "yes")
-    edge_soften_bool = str(edge_soften).lower() in ("true", "1", "on", "yes")
+    def to_bool(v):
+        return str(v).lower() in ("true", "1", "on", "yes")
 
     req = RemoveBgRequest(
         image_url=image_url,
         bg_hex=bg_hex,
         color_tolerance=int(color_tolerance),
+        two_stage=to_bool(two_stage),
+        strict_tolerance=int(strict_tolerance),
         erode_px=int(erode_px),
-        remove_holes=remove_holes_bool,
+        remove_holes=to_bool(remove_holes),
         min_hole_area=int(min_hole_area),
-        edge_soften=edge_soften_bool,
+        edge_soften=to_bool(edge_soften),
         edge_soften_px=float(edge_soften_px),
     )
 
