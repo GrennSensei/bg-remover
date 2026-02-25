@@ -106,4 +106,29 @@ def remove_white_bg(req: RemoveBgRequest):
 
 @app.get("/")
 def root():
+    from fastapi.responses import HTMLResponse
+from fastapi import Form
+
+@app.get("/test", response_class=HTMLResponse)
+def test_page():
+    return """
+    <html>
+      <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+        <h2>Background Remover Test</h2>
+        <p>Paste an image URL (JPG/PNG) with a white background, set tolerance, click Generate.</p>
+        <form method="post" action="/test">
+          <label>Image URL:</label><br/>
+          <input name="image_url" style="width:100%;" placeholder="https://..."><br/><br/>
+          <label>White tolerance (JPG: 45–65):</label><br/>
+          <input name="white_tolerance" type="number" value="55"><br/><br/>
+          <button type="submit">Generate Transparent PNG</button>
+        </form>
+      </body>
+    </html>
+    """
+
+@app.post("/test")
+def test_submit(image_url: str = Form(...), white_tolerance: int = Form(55)):
+    req = RemoveBgRequest(image_url=image_url, white_tolerance=white_tolerance)
+    return remove_white_bg(req)
     return {"status": "ok", "endpoint": "/remove-white-bg"}
