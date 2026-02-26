@@ -79,6 +79,14 @@ class RemoveBgRequest(BaseModel):
     edge_soften: bool = Field(default=False, description="Smooth jagged edges (recommended when tolerance is high)")
     edge_soften_px: float = Field(default=1.2, ge=0.0, description="Blur radius for edge soften (default 1.2)")
 
+    # NEW: edge soften strength (1–5), integer
+    edge_soften_strength: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Edge soften strength (1–5). Higher = stronger soften.",
+    )
+
     # Optional: remove residual neon green pixels in the output
     cleanup_residual_green: bool = Field(
         default=False,
@@ -423,14 +431,19 @@ def erode_alpha(rgba: Image.Image, erode_px: int) -> Image.Image:
 # -------------------------------
 # Optional: edge soften (anti-alias look) - refined (smoother edges)
 # -------------------------------
-def edge_soften_alpha(rgba: Image.Image, radius: float) -> Image.Image:
+def edge_soften_alpha(rgba: Image.Image, radius: float, strength: int) -> Image.Image:
     if radius <= 0:
         return rgba
+
+    if strength < 1:
+        strength = 1
 
     r, g, b, a = rgba.split()
 
     # Refined: keep the blurred alpha (no hard threshold), so tiny details are smoother.
-    a_blur = a.filter(ImageFilter.GaussianBlur(radius=radius))
+    a_blur = a
+    for _ in range(strength):
+        a_blur = a_blur.filter(ImageFilter.GaussianBlur(radius=radius))
 
     return Image.merge("RGBA", (r, g, b, a_blur))
 
@@ -507,7 +520,7 @@ def process_remove_bg(req: RemoveBgRequest) -> bytes:
 
     # Optional edge soften
     if req.edge_soften:
-        rgba = edge_soften_alpha(rgba, req.edge_soften_px)
+        rgba = edge_soften_alpha(rgba, req.edge_soften_px, req.edge_soften_strength)
 
     buf = io.BytesIO()
     rgba.save(buf, format="PNG")
@@ -537,6 +550,7 @@ def root():
             "erode_px": 1,
             "edge_soften": False,
             "edge_soften_px": 1.2,
+            "edge_soften_strength": 2,
             "remove_holes": True,
             "min_hole_area": 400,
             "cleanup_residual_green": False,
@@ -633,7 +647,10 @@ def test_page():
           <br/><br/>
 
           <label><b>Edge soften radius (px):</b></label><br/>
-          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0.96" style="width:140px; padding:10px;"><br/><br/>
+          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
+
+          <label><b>Edge soften strength (1–5):</b></label><br/>
+          <input name="edge_soften_strength" type="number" value="2" step="1" min="1" max="5" style="width:140px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
@@ -686,6 +703,7 @@ def test_submit(
     min_hole_area: int = Form(400),
     edge_soften: str = Form(None),
     edge_soften_px: float = Form(1.2),
+    edge_soften_strength: int = Form(2),
     cleanup_residual_green: str = Form(None),
     cleanup_green_percent: float = Form(15.0),
     cleanup_green_edge_only: str = Form(None),
@@ -707,6 +725,7 @@ def test_submit(
         min_hole_area=int(min_hole_area),
         edge_soften=to_bool(edge_soften),
         edge_soften_px=float(edge_soften_px),
+        edge_soften_strength=int(edge_soften_strength),
         cleanup_residual_green=to_bool(cleanup_residual_green),
         cleanup_green_percent=float(cleanup_green_percent),
         cleanup_green_edge_only=to_bool(cleanup_green_edge_only),
