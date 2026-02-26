@@ -63,21 +63,21 @@ class RemoveBgRequest(BaseModel):
     image_url: str
 
     bg_hex: str = Field(default="#FFFFFF", description="Key background color, e.g. #FFFFFF or #00FF00")
-    color_tolerance: int = Field(default=55, ge=0, le=255, description="Relaxed tolerance (JPG often needs 45–85)")
+    color_tolerance: int = Field(default=55, ge=0, description="Relaxed tolerance (JPG often needs 45–85)")
 
     # Two-stage floodfill (recommended for noisy JPG green/white)
     two_stage: bool = Field(default=True, description="Use strict+relaxed floodfill to avoid eating artwork edges")
-    strict_tolerance: int = Field(default=35, ge=0, le=255, description="Strict tolerance seed for border floodfill")
+    strict_tolerance: int = Field(default=35, ge=0, description="Strict tolerance seed for border floodfill")
 
-    erode_px: int = Field(default=1, ge=0, le=6, description="Shrinks alpha edge to remove halos")
+    erode_px: int = Field(default=1, ge=0, description="Shrinks alpha edge to remove halos")
 
     # Optional: memory-safe hole removal
     remove_holes: bool = Field(default=False, description="Remove enclosed background-colored holes inside artwork")
-    min_hole_area: int = Field(default=400, ge=0, le=10_000_000, description="Remove holes >= this pixel area")
+    min_hole_area: int = Field(default=400, ge=0, description="Remove holes >= this pixel area")
 
     # Optional: edge soften (anti-alias)
     edge_soften: bool = Field(default=False, description="Smooth jagged edges (recommended when tolerance is high)")
-    edge_soften_px: float = Field(default=1.2, ge=0.0, le=5.0, description="Blur radius for edge soften (default 1.2)")
+    edge_soften_px: float = Field(default=1.2, ge=0.0, description="Blur radius for edge soften (default 1.2)")
 
     # Optional: remove residual neon green pixels in the output
     cleanup_residual_green: bool = Field(
@@ -85,12 +85,17 @@ class RemoveBgRequest(BaseModel):
         description="If true, removes remaining #00FF00 (and close) pixels from the output PNG (made transparent).",
     )
 
-    # NEW: adjustable percent for green cleanup tolerance expansion
+    # Adjustable percent for green cleanup tolerance expansion (NO MAX)
     cleanup_green_percent: float = Field(
         default=15.0,
         ge=0.0,
-        le=200.0,
         description="Percent expansion applied to color_tolerance when removing residual #00FF00 pixels (default 15%).",
+    )
+
+    # NEW: edge-only cleanup switch
+    cleanup_green_edge_only: bool = Field(
+        default=True,
+        description="If true, green cleanup applies only along alpha edges (recommended).",
     )
 
 
@@ -198,7 +203,6 @@ def apply_alpha_from_mask_1d(img_rgb: Image.Image, bg_mask_1d: bytearray) -> Ima
 
 # -------------------------------
 # Optional: cleanup residual neon green pixels in already-transparent PNG
-# (done BEFORE erode/edge_soften so those post-process steps apply here too)
 # -------------------------------
 def cleanup_residual_green_pixels(rgba: Image.Image, tol: int) -> Image.Image:
     w, h = rgba.size
@@ -212,6 +216,55 @@ def cleanup_residual_green_pixels(rgba: Image.Image, tol: int) -> Image.Image:
             r, g, b, a = p[x, y]
             if a > 0 and is_near_color((r, g, b), target, tol):
                 p[x, y] = (r, g, b, 0)
+
+    return out
+
+
+def build_alpha_edge_mask(rgba: Image.Image) -> bytearray:
+    """
+    Edge mask = pixels that are on/near the alpha boundary.
+    A pixel is considered 'edge' if:
+      - 0 < alpha < 255 (semi-transparent), OR
+      - alpha > 0 and any 4-neighbor has alpha == 0 (touching transparency)
+    """
+    w, h = rgba.size
+    p = rgba.load()
+    mask = bytearray(w * h)
+
+    def idx(x, y):
+        return y * w + x
+
+    for y in range(h):
+        for x in range(w):
+            a = p[x, y][3]
+            if 0 < a < 255:
+                mask[idx(x, y)] = 1
+                continue
+            if a > 0:
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < w and 0 <= ny < h:
+                        if p[nx, ny][3] == 0:
+                            mask[idx(x, y)] = 1
+                            break
+
+    return mask
+
+
+def cleanup_residual_green_pixels_edge_only(rgba: Image.Image, tol: int, edge_mask: bytearray) -> Image.Image:
+    w, h = rgba.size
+    out = rgba.copy()
+    p = out.load()
+
+    target = (0, 255, 0)
+
+    i = 0
+    for y in range(h):
+        for x in range(w):
+            if edge_mask[i] == 1:
+                r, g, b, a = p[x, y]
+                if a > 0 and is_near_color((r, g, b), target, tol):
+                    p[x, y] = (r, g, b, 0)
+            i += 1
 
     return out
 
@@ -395,9 +448,13 @@ def process_remove_bg(req: RemoveBgRequest) -> bytes:
 
     # Optional: cleanup remaining neon green spill pixels in output (if enabled)
     if req.cleanup_residual_green:
-        # Use a capped tolerance so it doesn't nuke too much color range by accident.
-        green_tol = min(int(req.color_tolerance * (1.0 + (req.cleanup_green_percent / 100.0))), 45)
-        rgba = cleanup_residual_green_pixels(rgba, tol=green_tol)
+        green_tol = int(req.color_tolerance * (1.0 + (req.cleanup_green_percent / 100.0)))  # NO MAX CAP
+
+        if req.cleanup_green_edge_only:
+            edge_mask = build_alpha_edge_mask(rgba)
+            rgba = cleanup_residual_green_pixels_edge_only(rgba, tol=green_tol, edge_mask=edge_mask)
+        else:
+            rgba = cleanup_residual_green_pixels(rgba, tol=green_tol)
 
     # Erode edge (halo killer)
     rgba = erode_alpha(rgba, req.erode_px)
@@ -438,12 +495,14 @@ def root():
             "min_hole_area": 400,
             "cleanup_residual_green": False,
             "cleanup_green_percent": 15.0,
+            "cleanup_green_edge_only": True,
         },
         "tips": [
             "JPG green-screen often needs high tolerance; two_stage helps prevent eating edges.",
             "If green pixels remain: raise color_tolerance first, then enable edge_soften.",
             "If internal background pockets remain: enable remove_holes and lower min_hole_area (e.g. 250–600).",
-            "If neon green spill remains in the transparent PNG: enable cleanup_residual_green (and adjust % if needed).",
+            "If neon green spill remains: enable cleanup_residual_green and adjust cleanup_green_percent.",
+            "For tiny corner specks: keep cleanup_green_edge_only enabled.",
         ],
     }
 
@@ -469,7 +528,7 @@ def test_page():
           <br/><br/>
 
           <label><b>Relaxed tolerance:</b> (JPG often 45–85)</label><br/>
-          <input name="color_tolerance" type="number" value="55" min="0" max="255" style="width:120px; padding:10px;"><br/><br/>
+          <input name="color_tolerance" type="number" value="55" min="0" style="width:120px; padding:10px;"><br/><br/>
 
           <label><b>Two-stage keying (recommended for JPG):</b></label>
           <input name="two_stage" type="checkbox" checked>
@@ -477,10 +536,10 @@ def test_page():
           <br/><br/>
 
           <label><b>Strict tolerance:</b> (seed; typically 20–45)</label><br/>
-          <input name="strict_tolerance" type="number" value="35" min="0" max="255" style="width:120px; padding:10px;"><br/><br/>
+          <input name="strict_tolerance" type="number" value="35" min="0" style="width:120px; padding:10px;"><br/><br/>
 
           <label><b>Erode edge (px):</b> (halo killer; try 1–2)</label><br/>
-          <input name="erode_px" type="number" value="1" min="0" max="6" style="width:120px; padding:10px;"><br/><br/>
+          <input name="erode_px" type="number" value="1" min="0" style="width:120px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
@@ -490,7 +549,7 @@ def test_page():
           <br/><br/>
 
           <label><b>Min hole area (px):</b> (try 250–1500)</label><br/>
-          <input name="min_hole_area" type="number" value="400" min="0" max="10000000" style="width:140px; padding:10px;"><br/><br/>
+          <input name="min_hole_area" type="number" value="400" min="0" style="width:140px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
@@ -500,7 +559,7 @@ def test_page():
           <br/><br/>
 
           <label><b>Edge soften radius (px):</b> (recommended 1.2 for noisy JPG)</label><br/>
-          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
+          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" style="width:140px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
@@ -509,8 +568,13 @@ def test_page():
           <span style="color:#555;">Removes leftover green spill pixels from the transparent PNG</span>
           <br/><br/>
 
+          <label><b>Green cleanup edge-only</b> (recommended):</label>
+          <input name="cleanup_green_edge_only" type="checkbox" checked>
+          <span style="color:#555;">Only cleans green along alpha edges (best for tiny corner specks)</span>
+          <br/><br/>
+
           <label><b>Green cleanup tolerance boost (%):</b> (default 15)</label><br/>
-          <input name="cleanup_green_percent" type="number" value="15" step="1" min="0" max="200"
+          <input name="cleanup_green_percent" type="number" value="15" step="1" min="0"
                  style="width:140px; padding:10px;">
           <span style="margin-left:10px; color:#555;">Percent added on top of color_tolerance for the green cleanup step</span>
           <br/><br/>
@@ -524,7 +588,7 @@ def test_page():
           Suggested starting presets:
           <br/><b>White JPG</b>: tol=55, strict=35, erode=1, edge_soften OFF, holes OFF.
           <br/><b>Green JPG (noisy)</b>: tol=75, strict=35, erode=1, edge_soften ON (1.2), holes ON (min 300–600).
-          <br/><b>Residual neon green in PNG</b>: enable Cleanup residual neon green and try 15–35%.
+          <br/><b>Residual neon green in PNG</b>: enable Cleanup residual neon green; try 15–120% and keep edge-only ON.
         </p>
       </body>
     </html>
@@ -545,6 +609,7 @@ def test_submit(
     edge_soften_px: float = Form(1.2),
     cleanup_residual_green: str = Form(None),
     cleanup_green_percent: float = Form(15.0),
+    cleanup_green_edge_only: str = Form(None),
 ):
     def to_bool(v):
         return str(v).lower() in ("true", "1", "on", "yes")
@@ -562,6 +627,7 @@ def test_submit(
         edge_soften_px=float(edge_soften_px),
         cleanup_residual_green=to_bool(cleanup_residual_green),
         cleanup_green_percent=float(cleanup_green_percent),
+        cleanup_green_edge_only=to_bool(cleanup_green_edge_only),
     )
 
     png_bytes = process_remove_bg(req)
