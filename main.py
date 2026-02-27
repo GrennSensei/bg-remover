@@ -73,7 +73,7 @@ class RemoveBgRequest(BaseModel):
 
     # Optional: memory-safe hole removal
     remove_holes: bool = Field(default=True, description="Remove enclosed background-colored holes inside artwork")
-    min_hole_area: int = Field(default=400, ge=0, description="Remove holes >= this pixel area")
+    min_hole_area: int = Field(default=1, ge=0, description="Remove holes >= this pixel area")
 
     # Optional: edge soften (anti-alias)
     edge_soften: bool = Field(default=False, description="Smooth jagged edges (recommended when tolerance is high)")
@@ -108,9 +108,9 @@ class RemoveBgRequest(BaseModel):
 
     # NEW: adjustable expansion for the edge-only region (NO MAX)
     cleanup_edge_expand_percent: float = Field(
-        default=15.0,
+        default=20.0,
         ge=0.0,
-        description="Expands the edge-only cleanup region by a % that maps to a few-pixel dilation (default 15%).",
+        description="Expands the edge-only cleanup region by a % that maps to a few-pixel dilation (default 20%).",
     )
 
 
@@ -637,7 +637,7 @@ def test_page():
           <br/><br/>
 
           <label><b>Min hole area (px):</b> (try 250–1500)</label><br/>
-          <input name="min_hole_area" type="number" value="400" min="0" style="width:140px; padding:10px;"><br/><br/>
+          <input name="min_hole_area" type="number" value="1" min="0" style="width:140px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
@@ -646,11 +646,11 @@ def test_page():
           <span style="color:#555;">Smoother tiny details (improved)</span>
           <br/><br/>
 
-          <label><b>Edge soften radius (px):</b></label><br/>
-          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
-
           <label><b>Edge soften strength (1–5):</b></label><br/>
           <input name="edge_soften_strength" type="number" value="2" step="1" min="1" max="5" style="width:140px; padding:10px;"><br/><br/>
+
+          <label><b>Edge soften radius (px):</b></label><br/>
+          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
@@ -664,15 +664,15 @@ def test_page():
           <span style="color:#555;">Applies cleanup only near alpha edges</span>
           <br/><br/>
 
+          <label><b>Cleanup edge-only strength (%):</b> (default 20)</label><br/>
+          <input name="cleanup_edge_expand_percent" type="number" value="20" step="1" min="0"
+                 style="width:140px; padding:10px;">
+          <span style="margin-left:10px; color:#555;">10% ≈ +1px, 20% ≈ +2px, ...</span>
+          <br/><br/>
+
           <label><b>Green cleanup tolerance boost (%):</b> (default 15)</label><br/>
           <input name="cleanup_green_percent" type="number" value="15" step="1" min="0"
                  style="width:140px; padding:10px;">
-          <br/><br/>
-
-          <label><b>Edge-only expand (%):</b> (default 15)</label><br/>
-          <input name="cleanup_edge_expand_percent" type="number" value="15" step="1" min="0"
-                 style="width:140px; padding:10px;">
-          <span style="margin-left:10px; color:#555;">10% ≈ +1px, 20% ≈ +2px, ...</span>
           <br/><br/>
 
           <button type="submit" style="padding:12px 16px; font-weight:bold; cursor:pointer;">
@@ -683,7 +683,7 @@ def test_page():
         <p style="margin-top:16px; color:#666;">
           If tiny green specks remain in deep corners:
           enable cleanup + edge-only, then raise
-          <b>Edge-only expand</b> to 30–60% and <b>Green boost</b> to 30–120%.
+          <b>Cleanup edge-only strength</b> to 30–60% and <b>Green boost</b> to 30–120%.
         </p>
       </body>
     </html>
@@ -700,14 +700,14 @@ def test_submit(
     strict_tolerance: int = Form(35),
     erode_px: int = Form(1),
     remove_holes: str = Form(None),
-    min_hole_area: int = Form(400),
+    min_hole_area: int = Form(1),
     edge_soften: str = Form(None),
     edge_soften_px: float = Form(1.2),
     edge_soften_strength: int = Form(2),
     cleanup_residual_green: str = Form(None),
     cleanup_green_percent: float = Form(15.0),
     cleanup_green_edge_only: str = Form(None),
-    cleanup_edge_expand_percent: float = Form(15.0),
+    cleanup_edge_expand_percent: float = Form(20.0),
 ):
     def to_bool(v):
         return str(v).lower() in ("true", "1", "on", "yes")
