@@ -67,7 +67,7 @@ class RemoveBgRequest(BaseModel):
 
     # Two-stage floodfill (recommended for noisy JPG green/white)
     two_stage: bool = Field(default=True, description="Use strict+relaxed floodfill to avoid eating artwork edges")
-    strict_tolerance: int = Field(default=35, ge=0, description="Strict tolerance seed for border floodfill")
+    strict_tolerance: int = Field(default=45, ge=0, description="Strict tolerance seed for border floodfill")
 
     erode_px: int = Field(default=1, ge=0, description="Shrinks alpha edge to remove halos")
 
@@ -76,12 +76,12 @@ class RemoveBgRequest(BaseModel):
     min_hole_area: int = Field(default=1, ge=0, description="Remove holes >= this pixel area")
 
     # Optional: edge soften (anti-alias)
-    edge_soften: bool = Field(default=False, description="Smooth jagged edges (recommended when tolerance is high)")
-    edge_soften_px: float = Field(default=1.2, ge=0.0, description="Blur radius for edge soften (default 1.2)")
+    edge_soften: bool = Field(default=True, description="Smooth jagged edges (recommended when tolerance is high)")
+    edge_soften_px: float = Field(default=0.5, ge=0.0, description="Blur radius for edge soften (default 1.2)")
 
     # NEW: edge soften strength (1–5), integer
     edge_soften_strength: int = Field(
-        default=2,
+        default=3,
         ge=1,
         le=5,
         description="Edge soften strength (1–5). Higher = stronger soften.",
@@ -89,13 +89,13 @@ class RemoveBgRequest(BaseModel):
 
     # Optional: remove residual neon green pixels in the output
     cleanup_residual_green: bool = Field(
-        default=False,
+        default=True,
         description="If true, removes remaining #00FF00 (and close) pixels from the output PNG (made transparent).",
     )
 
     # Adjustable percent for green cleanup tolerance expansion (NO MAX)
     cleanup_green_percent: float = Field(
-        default=15.0,
+        default=120.0,
         ge=0.0,
         description="Percent expansion applied to color_tolerance when removing residual #00FF00 pixels (default 15%).",
     )
@@ -108,7 +108,7 @@ class RemoveBgRequest(BaseModel):
 
     # NEW: adjustable expansion for the edge-only region (NO MAX)
     cleanup_edge_expand_percent: float = Field(
-        default=20.0,
+        default=50.0,
         ge=0.0,
         description="Expands the edge-only cleanup region by a % that maps to a few-pixel dilation (default 20%).",
     )
@@ -546,17 +546,17 @@ def root():
             "bg_hex": "#FFFFFF",
             "color_tolerance": 90,
             "two_stage": True,
-            "strict_tolerance": 35,
+            "strict_tolerance": 45,
             "erode_px": 1,
-            "edge_soften": False,
-            "edge_soften_px": 1.2,
-            "edge_soften_strength": 2,
+            "edge_soften": True,
+            "edge_soften_px": 0.5,
+            "edge_soften_strength": 3,
             "remove_holes": True,
-            "min_hole_area": 400,
-            "cleanup_residual_green": False,
-            "cleanup_green_percent": 15.0,
+            "min_hole_area": 1,
+            "cleanup_residual_green": True,
+            "cleanup_green_percent": 120.0,
             "cleanup_green_edge_only": True,
-            "cleanup_edge_expand_percent": 15.0,
+            "cleanup_edge_expand_percent": 50.0,
         },
         "tips": [
             "JPG green-screen often needs high tolerance; two_stage helps prevent eating edges.",
@@ -584,11 +584,11 @@ def test_page():
 
           <label><b>Background color:</b></label><br/>
           <label style="margin-right:14px;">
-            <input id="bg_green" name="bg_green" type="checkbox">
+            <input id="bg_green" name="bg_green" type="checkbox" checked>
             #00FF00 (green)
           </label>
           <label>
-            <input id="bg_white" name="bg_white" type="checkbox" checked>
+            <input id="bg_white" name="bg_white" type="checkbox">
             #FFFFFF (white)
           </label>
 
@@ -602,14 +602,14 @@ def test_page():
                 if (changed === white && white.checked) green.checked = false;
 
                 // ensure one is always selected
-                if (!green.checked && !white.checked) white.checked = true;
+                if (!green.checked && !white.checked) green.checked = true;
               }
 
               green.addEventListener('change', function () { enforceExclusive(green); });
               white.addEventListener('change', function () { enforceExclusive(white); });
 
               // initialize
-              enforceExclusive(white);
+              enforceExclusive(green);
             })();
           </script>
 
@@ -624,7 +624,7 @@ def test_page():
           <br/><br/>
 
           <label><b>Strict tolerance:</b> (seed; typically 20–45)</label><br/>
-          <input name="strict_tolerance" type="number" value="35" min="0" style="width:120px; padding:10px;"><br/><br/>
+          <input name="strict_tolerance" type="number" value="45" min="0" style="width:120px; padding:10px;"><br/><br/>
 
           <label><b>Erode edge (px):</b> (halo killer; try 1–2)</label><br/>
           <input name="erode_px" type="number" value="1" min="0" style="width:120px; padding:10px;"><br/><br/>
@@ -642,20 +642,20 @@ def test_page():
           <hr style="margin:18px 0;"/>
 
           <label><b>Edge soften</b> (optional):</label>
-          <input name="edge_soften" type="checkbox">
+          <input name="edge_soften" type="checkbox" checked>
           <span style="color:#555;">Smoother tiny details (improved)</span>
           <br/><br/>
 
           <label><b>Edge soften strength (1–5):</b></label><br/>
-          <input name="edge_soften_strength" type="number" value="2" step="1" min="1" max="5" style="width:140px; padding:10px;"><br/><br/>
+          <input name="edge_soften_strength" type="number" value="3" step="1" min="1" max="5" style="width:140px; padding:10px;"><br/><br/>
 
           <label><b>Edge soften radius (px):</b></label><br/>
-          <input name="edge_soften_px" type="number" value="1.2" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
+          <input name="edge_soften_px" type="number" value="0.5" step="0.1" min="0" max="5" style="width:140px; padding:10px;"><br/><br/>
 
           <hr style="margin:18px 0;"/>
 
           <label><b>Cleanup residual neon green (#00FF00)</b> (optional):</label>
-          <input name="cleanup_residual_green" type="checkbox">
+          <input name="cleanup_residual_green" type="checkbox" checked>
           <span style="color:#555;">Removes leftover green spill pixels from the transparent PNG</span>
           <br/><br/>
 
@@ -665,13 +665,13 @@ def test_page():
           <br/><br/>
 
           <label><b>Cleanup edge-only strength (%):</b> (default 20)</label><br/>
-          <input name="cleanup_edge_expand_percent" type="number" value="20" step="1" min="0"
+          <input name="cleanup_edge_expand_percent" type="number" value="50" step="1" min="0"
                  style="width:140px; padding:10px;">
           <span style="margin-left:10px; color:#555;">10% ≈ +1px, 20% ≈ +2px, ...</span>
           <br/><br/>
 
           <label><b>Green cleanup tolerance boost (%):</b> (default 15)</label><br/>
-          <input name="cleanup_green_percent" type="number" value="15" step="1" min="0"
+          <input name="cleanup_green_percent" type="number" value="120" step="1" min="0"
                  style="width:140px; padding:10px;">
           <br/><br/>
 
@@ -697,17 +697,17 @@ def test_submit(
     bg_white: str = Form(None),
     color_tolerance: int = Form(90),
     two_stage: str = Form(None),
-    strict_tolerance: int = Form(35),
+    strict_tolerance: int = Form(45),
     erode_px: int = Form(1),
     remove_holes: str = Form(None),
     min_hole_area: int = Form(1),
-    edge_soften: str = Form(None),
-    edge_soften_px: float = Form(1.2),
-    edge_soften_strength: int = Form(2),
-    cleanup_residual_green: str = Form(None),
-    cleanup_green_percent: float = Form(15.0),
-    cleanup_green_edge_only: str = Form(None),
-    cleanup_edge_expand_percent: float = Form(20.0),
+    edge_soften: str = Form("on"),
+    edge_soften_px: float = Form(0.5),
+    edge_soften_strength: int = Form(3),
+    cleanup_residual_green: str = Form("on"),
+    cleanup_green_percent: float = Form(120.0),
+    cleanup_green_edge_only: str = Form("on"),
+    cleanup_edge_expand_percent: float = Form(50.0),
 ):
     def to_bool(v):
         return str(v).lower() in ("true", "1", "on", "yes")
